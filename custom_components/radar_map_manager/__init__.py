@@ -21,7 +21,7 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.config_entries import ConfigEntry
 from .coordinator import RadarCoordinator
 from .processor import RadarProcessor
@@ -137,6 +137,8 @@ UPDATE_MAP_CONFIG_SCHEMA = vol.Schema({
     vol.Optional("max_jump_base"): vol.Coerce(float),
     vol.Optional("max_jump_speed"): vol.Coerce(float),
     vol.Optional("stationary_max_hold"): vol.Coerce(float),
+    vol.Optional("auto_block_duration"): vol.Coerce(int),
+    vol.Optional("panel_opacity"): vol.Coerce(float),
 })
 def get_t(hass, key, *args):
     lang = hass.config.language if hasattr(hass.config, 'language') else 'en'
@@ -155,6 +157,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """当用户从 UI 添加集成时，HA 会调用这里."""
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN].setdefault("capabilities_cache", {})
+    hass.data[DOMAIN].setdefault("raw_capabilities_cache", {})
     hass.data[DOMAIN].setdefault("pending_auth", {})
     hass.data[DOMAIN].setdefault("live_data", {})
     hass.data[DOMAIN].setdefault("notified_basic", set())
@@ -220,9 +223,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             _processing_tick, 
             timedelta(seconds=safe_interval)
         )
-    async def broadcast_hw_zones():
+    async def broadcast_hw_zones(target_radar=None, allow_empty=False):
         if not coordinator.data or "radars" not in coordinator.data: return
-        for r_name, r_conf in coordinator.data.get("radars", {}).items():
+        radars_to_broadcast = [target_radar] if target_radar else list(coordinator.data.get("radars", {}).keys())
+        for r_name in radars_to_broadcast:
+            r_conf = coordinator.data.get("radars", {}).get(r_name)
+            if not r_conf: continue
             if not r_conf.get("auth_passed", False):
                 continue
             caps = r_conf.get("capabilities", {})
@@ -260,48 +266,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                                 pass
                         res.append([int(x_min), int(y_min), int(x_max), int(y_max), dly])
                 return res
+            rect_detect = extract_rects(r_conf.get("hw_detect_zones", []))
+            rect_block = extract_rects(r_conf.get("hw_block_zones", []))
+            rect_stay = extract_rects(r_conf.get("hw_stay_zones", []))
+            if not rect_detect and not rect_block and not rect_stay and not allow_empty:
+                _LOGGER.debug(f"RMM: 🛡️ [SSOT Guard] 跳过向雷达 '{r_name}' 下发空硬件防区，保留硬件端 NVS 真实防区")
+                continue
             payload_dict = {
-                "detect": extract_rects(r_conf.get("hw_detect_zones", [])),
-                "block": extract_rects(r_conf.get("hw_block_zones", [])),
-                "stay": extract_rects(r_conf.get("hw_stay_zones", []))
+                "detect": rect_detect,
+                "block": rect_block,
+                "stay": rect_stay
             }
             payload = json.dumps(payload_dict)
             topic = f"rmm_radar/{r_name}/hw_zone/set"
-            await mqtt.async_publish(hass, topic, payload, retain=True)
+            await mqtt.async_publish(hass, topic, payload, retain=False)
             _LOGGER.info(f"RMM: Sync JSON HW Zones to {topic}: {payload}")
-    async def broadcast_monitor_zones():
+    async def clear_legacy_monitor_zones(radar_name=None):
+        """Clean up legacy retained monitor_zone and hw_zone/set MQTT topics from broker.
+        """
         if not coordinator.data or "radars" not in coordinator.data: return
-        for r_name, r_conf in coordinator.data.get("radars", {}).items():
-            monitor_zones = r_conf.get("monitor_zones", [])
-            layout = r_conf.get("layout", {})
-            ox = float(layout.get('origin_x', 50)); oy = float(layout.get('origin_y', 50))
-            sx = float(layout.get('scale_x', 5)); sy = float(layout.get('scale_y', 5))
-            if sx <= 0: sx = 5.0
-            if sy <= 0: sy = 5.0
-            rot = float(layout.get('rotation', 0))
-            base_rad = (rot - 90) * math.pi / 180.0
-            y_vec_x = math.cos(base_rad); y_vec_y = math.sin(base_rad)
-            x_vec_x = math.cos(base_rad + (math.pi / 2)); x_vec_y = math.sin(base_rad + (math.pi / 2))
-            zone_strings = []
-            for zone in monitor_zones:
-                pts = (zone.get("points", []) if isinstance(zone, dict) else zone) or []
-                if len(pts) >= 3:
-                    pt_strings = []
-                    for p in pts[:20]:
-                        dx = p[0] - ox; dy = p[1] - oy
-                        x_m = (dx * x_vec_x + dy * x_vec_y) / sx
-                        y_m = (dx * y_vec_x + dy * y_vec_y) / sy
-                        if layout.get('mirror_x', False): x_m = -x_m
-                        pt_strings.append(f"{int(x_m * 1000)},{int(y_m * 1000)}")
-                    zone_strings.append(",".join(pt_strings))
-            payload = ";".join(zone_strings)
+        radars_to_clear = [radar_name] if radar_name else list(coordinator.data.get("radars", {}).keys())
+        for r_name in radars_to_clear:
             topic = f"rmm_radar/{r_name}/monitor_zone/set"
             try:
-                await mqtt.async_publish(hass, topic, payload, retain=True)
-                if payload:
-                    _LOGGER.info(f"RMM: Sync Monitor Zones to {topic}: {payload}")
+                await mqtt.async_publish(hass, topic, "", retain=True)
+                _LOGGER.debug(f"RMM: Cleared legacy monitor_zone MQTT topic: {topic}")
             except Exception as e:
-                _LOGGER.error(f"RMM: Failed to publish monitor zones to {topic}: {e}")
+                _LOGGER.error(f"RMM: Failed to clear legacy monitor_zone topic {topic}: {e}")
+            try:
+                await mqtt.async_publish(hass, f"rmm_radar/{r_name}/hw_zone/set", "", retain=True)
+                _LOGGER.debug(f"RMM: Cleared legacy retained hw_zone/set topic for {r_name}")
+            except Exception as e:
+                pass
     async def handle_add_radar(call: ServiceCall):
         radar_name = call.data["radar_name"]
         map_group = call.data.get("map_group", "default")
@@ -347,11 +343,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         if not current_pin:
             return
         nonce = secrets.token_hex(8)
+        raw_caps = hass.data[DOMAIN].get("raw_capabilities_cache", {}).get(radar_name)
+        if not raw_caps:
+            raw_caps = cached_caps
         hass.data[DOMAIN]["pending_auth"][radar_name] = {
             "nonce": nonce,
             "mac": "",
             "time": time.time(),
-            "real_caps": cached_caps if cached_caps else {},
+            "real_caps": raw_caps.copy() if raw_caps else {},
             "is_manual_add": True 
         }
         await mqtt.async_publish(
@@ -421,10 +420,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             await coordinator.async_save()
         else:
             await coordinator.async_update_zone(radar_name, zone_type, zone_data, map_group)
-            if zone_type == "monitor_zones":
-                await broadcast_monitor_zones()
-            elif zone_type in ["hw_detect_zones", "hw_block_zones", "hw_stay_zones"]:
-                await broadcast_hw_zones()
+            if zone_type in ["hw_detect_zones", "hw_block_zones", "hw_stay_zones"]:
+                await broadcast_hw_zones(target_radar=radar_name, allow_empty=True)
         await processor.update(force=True)
     async def handle_update_radar_layout(call: ServiceCall):
         radar_name = call.data["radar_name"]
@@ -432,8 +429,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         map_group = call.data.get("map_group")
         await coordinator.async_update_layout(radar_name, layout, map_group)
         await processor.update(force=True)
-        await broadcast_hw_zones()
-        await broadcast_monitor_zones()
+        await broadcast_hw_zones(target_radar=radar_name, allow_empty=False)
     async def handle_generate_config(call: ServiceCall):
         await processor.update(force=True)
     async def handle_update_map_config(call: ServiceCall):
@@ -494,7 +490,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                         coordinator.data["radars"][k] = v
             await coordinator.async_save()
             await broadcast_hw_zones()
-            await broadcast_monitor_zones()
+            await clear_legacy_monitor_zones()
             intervals = [m.get("config", {}).get("update_interval", 0.1) for m in coordinator.data.get("maps", {}).values()]
             start_processing_loop(min(intervals) if intervals else 0.1)
             await processor.update(force=True)
@@ -546,8 +542,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                         stale_keys.append(k)
                 for k in stale_keys:
                     hass.data[DOMAIN]["capabilities_cache"].pop(k, None)
+                    hass.data[DOMAIN].get("raw_capabilities_cache", {}).pop(k, None)
                     hass.async_create_task(mqtt.async_publish(hass, f"rmm_radar/{k}/info", "", retain=True))
+                if mac and coordinator.data and "radars" in coordinator.data:
+                    renamed_from = None
+                    for existing_name, existing_conf in list(coordinator.data.get("radars", {}).items()):
+                        if existing_name == r_name:
+                            continue
+                        existing_mac = existing_conf.get("mac") or existing_conf.get("capabilities", {}).get("mac")
+                        if (existing_mac and existing_mac.lower() == mac.lower()) or existing_name in stale_keys:
+                            renamed_from = existing_name
+                            break
+                    if renamed_from:
+                        _LOGGER.info(f"RMM: 🎯 检测到雷达硬件更名 [{renamed_from}] -> [{r_name}] (MAC: {mac})，正在无缝平移户型图坐标与防区！")
+                        old_conf = coordinator.data["radars"].pop(renamed_from)
+                        old_conf["mac"] = mac
+                        if r_ip:
+                            old_conf["radar_ip"] = r_ip
+                        coordinator.data["radars"][r_name] = old_conf
+                        for old_sub in ["info", "hw_zones/state", "hw_zone/set", "zone_presence", "update/state", "version/state"]:
+                            hass.async_create_task(mqtt.async_publish(hass, f"rmm_radar/{renamed_from}/{old_sub}", "", retain=True))
+                        hass.async_create_task(coordinator.async_save())
+                        coordinator._notify_listeners()
+                if r_name in coordinator.data.get("radars", {}):
+                    coordinator.data["radars"][r_name]["mac"] = mac
                 hass.data[DOMAIN]["capabilities_cache"][r_name] = degraded_caps
+                hass.data[DOMAIN].setdefault("raw_capabilities_cache", {})[r_name] = caps.copy()
                 pending = hass.data[DOMAIN]["pending_auth"].get(r_name)
                 if pending and (time.time() - pending.get("time", 0) < 5):
                     _LOGGER.info(f"RMM: 正在手动鉴权中，拦截 info 触发的并发覆盖 -> {r_name}")
@@ -637,9 +657,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                         if coordinator.data["radars"][r_name].get("capabilities") != real_caps:
                             coordinator.data["radars"][r_name]["capabilities"] = real_caps
                             hass.async_create_task(coordinator.async_save())
-                        _LOGGER.info(f"RMM: 雷达 '{r_name}' 重启上线完成鉴权，正在自动同步下发最新区域配置...")
-                        hass.async_create_task(broadcast_hw_zones())
-                        hass.async_create_task(broadcast_monitor_zones())
+                        _LOGGER.info(f"RMM: 雷达 '{r_name}' 重启上线完成鉴权，等待接收硬件区域状态广播...")
+                        hass.async_create_task(clear_legacy_monitor_zones(r_name))
                     hass.data[DOMAIN]["pending_auth"].pop(r_name, None)
                     coordinator._notify_listeners()
                 else:
@@ -722,7 +741,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     _LOGGER.info(f"RMM: [硬件协同] 收到雷达 {r_name} 物理偏航角偏移 {delta_yaw}°，新朝向: {new_rot}°")
                     await coordinator.async_save()
                     await broadcast_hw_zones()
-                    await broadcast_monitor_zones()
                     await processor.update(force=True)
         except Exception as e:
             _LOGGER.error(f"RMM: Failed to parse yaw_delta: {e}")
@@ -734,61 +752,136 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             if len(topic_parts) >= 3:
                 r_name = topic_parts[1]
                 state = payload.get("state")
-                if state == "COMPLETED" and "blocks" in payload:
-                    if "radars" in coordinator.data and r_name in coordinator.data["radars"]:
-                        r_conf = coordinator.data["radars"][r_name]
-                        layout = r_conf.get("layout", {})
-                        ox = float(layout.get('origin_x', 50)); oy = float(layout.get('origin_y', 50))
-                        sx = float(layout.get('scale_x', 5)); sy = float(layout.get('scale_y', 5))
-                        rot = float(layout.get('rotation', 0))
-                        base_rad = (rot - 90) * math.pi / 180.0
-                        y_vec_x = math.cos(base_rad); y_vec_y = math.sin(base_rad)
-                        x_vec_x = math.cos(base_rad + (math.pi / 2)); x_vec_y = math.sin(base_rad + (math.pi / 2))
-                        def to_canvas_pt(xm, ym):
-                            if layout.get('mirror_x', False):
-                                xm = -xm
-                            px = ox + (xm * sx * x_vec_x) + (ym * sy * y_vec_x)
-                            py = oy + (xm * sx * x_vec_y) + (ym * sy * y_vec_y)
-                            return [round(px, 2), round(py, 2)]
-                        blocks = payload["blocks"]
-                        existing_names = set()
-                        for r_k, r_v in coordinator.data.get("radars", {}).items():
-                            for z_type in ["hw_detect_zones", "hw_block_zones", "hw_stay_zones", "monitor_zones"]:
-                                for z in r_v.get(z_type, []):
-                                    if isinstance(z, dict) and "name" in z:
-                                        existing_names.add(z["name"].strip())
-                        for m_k, m_v in coordinator.data.get("maps", {}).items():
-                            for z_type in ["include_zones", "exclude_zones", "entrance_zones", "stationary_zones"]:
-                                for z in m_v.get("zones", {}).get(z_type, []):
-                                    if isinstance(z, dict) and "name" in z:
-                                        existing_names.add(z["name"].strip())
-                        hw_block_zones = []
-                        used_names = set(existing_names)
-                        for idx, b in enumerate(blocks):
-                            if len(b) >= 4:
-                                x1 = b[0] / 1000.0; y1 = b[1] / 1000.0
-                                x2 = b[2] / 1000.0; y2 = b[3] / 1000.0
+                async_dispatcher_send(hass, "rmm_auto_block_event", {"radar": r_name, "payload": payload})
+        except Exception as e:
+            _LOGGER.error(f"RMM: Failed to parse auto_block_state: {e}")
+    @callback
+    async def async_on_hw_zone_state(msg):
+        try:
+            payload = json.loads(msg.payload)
+            topic_parts = msg.topic.split('/')
+            if len(topic_parts) >= 3:
+                r_name = topic_parts[1]
+                if not coordinator.data or "radars" not in coordinator.data:
+                    return
+                target_key = None
+                if r_name in coordinator.data["radars"]:
+                    target_key = r_name
+                elif r_name.lower() in coordinator.data["radars"]:
+                    target_key = r_name.lower()
+                if not target_key:
+                    return
+                r_conf = coordinator.data["radars"][target_key]
+                layout = r_conf.get("layout", {})
+                ox = float(layout.get('origin_x', 50)); oy = float(layout.get('origin_y', 50))
+                sx = float(layout.get('scale_x', 5)); sy = float(layout.get('scale_y', 5))
+                rot = float(layout.get('rotation', 0))
+                base_rad = (rot - 90) * math.pi / 180.0
+                y_vec_x = math.cos(base_rad); y_vec_y = math.sin(base_rad)
+                x_vec_x = math.cos(base_rad + (math.pi / 2)); x_vec_y = math.sin(base_rad + (math.pi / 2))
+                def to_canvas_pt(xm, ym):
+                    if layout.get('mirror_x', False):
+                        xm = -xm
+                    px = ox + (xm * sx * x_vec_x) + (ym * sy * y_vec_x)
+                    py = oy + (xm * sx * x_vec_y) + (ym * sy * y_vec_y)
+                    return [round(px, 2), round(py, 2)]
+                new_detect = []
+                new_block = []
+                new_stay = []
+                if "zones" in payload and isinstance(payload["zones"], list):
+                    for idx, z in enumerate(payload["zones"]):
+                        z_type = z.get("type", "detect")
+                        if "x1_mm" in z and "y1_mm" in z and "x2_mm" in z and "y2_mm" in z:
+                            x1 = float(z["x1_mm"]) / 1000.0; y1 = float(z["y1_mm"]) / 1000.0
+                            x2 = float(z["x2_mm"]) / 1000.0; y2 = float(z["y2_mm"]) / 1000.0
+                        elif "x1" in z and "y1" in z and "x2" in z and "y2" in z:
+                            x1 = float(z["x1"]); y1 = float(z["y1"])
+                            x2 = float(z["x2"]); y2 = float(z["y2"])
+                        else:
+                            continue
+                        p1 = to_canvas_pt(x1, y1)
+                        p2 = to_canvas_pt(x2, y1)
+                        p3 = to_canvas_pt(x2, y2)
+                        p4 = to_canvas_pt(x1, y2)
+                        def_name = f"HW {z_type.title()} {idx + 1}"
+                        raw_name = z.get("name")
+                        if not raw_name or raw_name == f"Block {idx + 1}" or raw_name == f"Zone {idx + 1}" or raw_name == f"Stay {idx + 1}":
+                            zone_name = def_name
+                        else:
+                            zone_name = raw_name
+                        z_obj = {
+                            "name": zone_name,
+                            "points": [p1, p2, p3, p4]
+                        }
+                        if "delay" in z:
+                            z_obj["delay"] = z["delay"]
+                        if z_type == "detect":
+                            new_detect.append(z_obj)
+                        elif z_type == "block":
+                            new_block.append(z_obj)
+                        elif z_type == "stay":
+                            new_stay.append(z_obj)
+                else:
+                    names = payload.get("names", [])
+                    def parse_rects(rect_list, type_name):
+                        res = []
+                        for i, r in enumerate(rect_list):
+                            if len(r) >= 4:
+                                x1 = float(r[0]) / 1000.0; y1 = float(r[1]) / 1000.0
+                                x2 = float(r[2]) / 1000.0; y2 = float(r[3]) / 1000.0
                                 p1 = to_canvas_pt(x1, y1)
                                 p2 = to_canvas_pt(x2, y1)
                                 p3 = to_canvas_pt(x2, y2)
                                 p4 = to_canvas_pt(x1, y2)
-                                seq = idx + 1
-                                candidate_name = f"HW Block {seq}"
-                                while candidate_name in used_names:
-                                    seq += 1
-                                    candidate_name = f"HW Block {seq}"
-                                used_names.add(candidate_name)
-                                hw_block_zones.append({
-                                    "name": candidate_name,
-                                    "points": [p1, p2, p3, p4]
-                                })
-                        coordinator.data["radars"][r_name]["hw_block_zones"] = hw_block_zones
-                        _LOGGER.info(f"RMM: [AutoBlock] 自动识别排除区同步完成 (已去重命名): {r_name}, {len(hw_block_zones)} 个区域")
-                        await coordinator.async_save()
-                        await processor.update(force=True)
-                async_dispatcher_send(hass, "rmm_auto_block_event", {"radar": r_name, "payload": payload})
+                                name = names[i] if i < len(names) and names[i] else f"HW {type_name.title()} {i + 1}"
+                                item = {"name": name, "points": [p1, p2, p3, p4]}
+                                if len(r) >= 5:
+                                    item["delay"] = r[4]
+                                res.append(item)
+                        return res
+                    if "detect" in payload:
+                        new_detect = parse_rects(payload["detect"], "detect")
+                    if "block" in payload:
+                        new_block = parse_rects(payload["block"], "block")
+                    if "stay" in payload:
+                        new_stay = parse_rects(payload["stay"], "stay")
+                def zones_differ(old_zones, new_zones):
+                    if len(old_zones) != len(new_zones):
+                        return True
+                    for oz, nz in zip(old_zones, new_zones):
+                        if oz.get("name") != nz.get("name"):
+                            return True
+                        pts_old = oz.get("points", [])
+                        pts_new = nz.get("points", [])
+                        if len(pts_old) != len(pts_new):
+                            return True
+                        for p_o, p_n in zip(pts_old, pts_new):
+                            if abs(p_o[0] - p_n[0]) > 0.5 or abs(p_o[1] - p_n[1]) > 0.5:
+                                return True
+                    return False
+                cur_detect = r_conf.get("hw_detect_zones", [])
+                cur_block = r_conf.get("hw_block_zones", [])
+                cur_stay = r_conf.get("hw_stay_zones", [])
+                detect_changed = zones_differ(cur_detect, new_detect)
+                block_changed = zones_differ(cur_block, new_block)
+                stay_changed = zones_differ(cur_stay, new_stay)
+                if detect_changed or block_changed or stay_changed:
+                    r_conf["hw_detect_zones"] = new_detect
+                    r_conf["hw_block_zones"] = new_block
+                    r_conf["hw_stay_zones"] = new_stay
+                    _LOGGER.info(
+                        f"RMM: [SSOT] 已自动从硬件对齐防区 ({target_key}): "
+                        f"检测区={len(new_detect)}, 屏蔽区={len(new_block)}, 驻留区={len(new_stay)}"
+                    )
+                    await coordinator.async_save()
+                    await processor.update(force=True)
+                    async_dispatcher_send(
+                        hass, 
+                        "rmm_hw_zone_state_updated", 
+                        {"radar": target_key, "detect": new_detect, "block": new_block, "stay": new_stay}
+                    )
         except Exception as e:
-            _LOGGER.error(f"RMM: Failed to parse auto_block_state: {e}")
+            _LOGGER.error(f"RMM: Failed to parse hw_zone_state: {e}")
     @callback
     def on_radar_data(msg):
         try:
@@ -955,7 +1048,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             if intervals: min_interval = min(intervals)
         start_processing_loop(float(min_interval))
         await processor.update(force=True)
-        await broadcast_hw_zones()
+        await clear_legacy_monitor_zones()
         try:
             from homeassistant.helpers import device_registry as dr
             dev_reg = dr.async_get(hass)
@@ -983,6 +1076,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             await mqtt.async_subscribe(hass, "rmm_radar/+/data", on_radar_data)
             await mqtt.async_subscribe(hass, "rmm_radar/+/yaw_delta/state", async_on_yaw_delta)
             await mqtt.async_subscribe(hass, "rmm_radar/+/auto_block/state", async_on_auto_block_state)
+            await mqtt.async_subscribe(hass, "rmm_radar/+/hw_zone/state", async_on_hw_zone_state)
             await mqtt.async_subscribe(hass, "rmm_radar/+/availability", on_radar_availability)
             await mqtt.async_subscribe(hass, "rmm_radar/+/pair/request", async_on_pair_request)
             _LOGGER.info("RMM: Successfully subscribed to info and auth topics")

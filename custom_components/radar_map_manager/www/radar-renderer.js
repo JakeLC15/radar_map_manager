@@ -169,9 +169,18 @@ export class RadarRenderer {
         const radarData = (state.data && state.data[rName]) || {};
         if (radarType === undefined) radarType = radarData.capabilities && radarData.capabilities.radar_type !== undefined ? radarData.capabilities.radar_type : 1;
         let radarH = getVal('mount_height', 2.5);
-        if (hass) {
-            const hEntId = `number.${rName.toLowerCase()}_radar_height`;
-            if (hass.states[hEntId] && hass.states[hEntId].state !== 'unavailable') {
+        const hasTempHeight = state.editMode === 'layout' && rName === state.radar && state.layoutChanges && state.layoutChanges['mount_height'] !== undefined;
+        if (!hasTempHeight && hass) {
+            let safeR = rName.toLowerCase().replace(/ /g, "_").replace(/-/g, "_");
+            let hEntId = `number.${safeR}_radar_height`;
+            if (!hass.states[hEntId]) {
+                const found = Object.keys(hass.states).find(k => 
+                    k.startsWith(`number.${safeR}`) && 
+                    (k.includes('radar_height') || k.includes('install_height') || k.includes('height'))
+                );
+                if (found) hEntId = found;
+            }
+            if (hass.states[hEntId] && hass.states[hEntId].state !== 'unavailable' && hass.states[hEntId].state !== 'unknown') {
                 radarH = parseFloat(hass.states[hEntId].state) || radarH;
             }
         }

@@ -85,6 +85,7 @@ class RadarCoordinator:
         self.data["radars"][name] = {
             "map_group": map_group,
             "paused": False,
+            "auth_passed": False,
             "layout": {"origin_x": 50, "origin_y": 50, "scale_x": 5, "scale_y": 5, "rotation": 0},
             "monitor_zones": []
         }

@@ -1,7 +1,7 @@
 import { RadarMath } from './radar-math.js?v=1.2.4';
-import { RadarUI } from './radar-ui.js?v=1.2.4';
-import { RadarRenderer } from './radar-renderer.js?v=1.2.4'; 
-import { RadarEditor } from './radar-editor.js?v=1.2.4';
+import { RadarUI } from './radar-ui.js?v=1.2.7';
+import { RadarRenderer } from './radar-renderer.js?v=1.2.5'; 
+import { RadarEditor } from './radar-editor.js?v=1.2.7';
 const CARD_I18N = {
     "proxy_ok": { "zh": "[RMM VIP] 雷达 {0} 代理认证成功！专属高频点云已通过 HA 隧道激活。", "en": "[RMM VIP] Radar {0} proxy auth successful! Exclusive high-frequency point cloud activated via HA tunnel." },
     "proxy_fail": { "zh": "[RMM VIP] 代理中继连接失败 ({0})，已静默降级为 MQTT 模式。", "en": "[RMM VIP] Proxy relay connection failed ({0}), silently downgraded to MQTT mode." }
@@ -54,8 +54,14 @@ class RadarMapCardNative extends HTMLElement {
         });
     }
     t(key, arg0 = "") {
-        const lang = (this.state.hass && this.state.hass.language) || 'en';
-        const isZh = lang.startsWith('zh');
+        const stored = localStorage.getItem('rmm_panel_lang');
+        let isZh;
+        if (stored === 'zh' || stored === 'en') {
+            isZh = (stored === 'zh');
+        } else {
+            const lang = (this.state.hass && this.state.hass.language) || 'en';
+            isZh = lang.startsWith('zh');
+        }
         if (CARD_I18N[key]) {
             let txt = isZh ? CARD_I18N[key].zh : CARD_I18N[key].en;
             return txt.replace("{0}", arg0);
@@ -182,8 +188,8 @@ class RadarMapCardNative extends HTMLElement {
         hud.style.display = 'flex';
         const txtEl = hud.querySelector('#autoblock-hud-text');
         const barEl = hud.querySelector('#autoblock-hud-bar');
-        const lang = (this.state.hass && this.state.hass.language) || 'en';
-        const isZh = lang.startsWith('zh');
+        const stored = localStorage.getItem('rmm_panel_lang');
+        const isZh = (stored === 'zh' || (!stored && this.state.hass?.language?.startsWith('zh')));
         let remaining = totalSec;
         const updateHUD = () => {
             if (txtEl) {
@@ -537,6 +543,31 @@ class RadarMapCardNative extends HTMLElement {
                             entity_id: entId,
                             option: isCeiling ? 'Ceiling' : 'Wall'
                         });
+                    }
+                }
+                if (that.state.layoutChanges.mount_height !== undefined || newLayout.mount_height !== undefined) {
+                    const targetHeight = that.state.layoutChanges.mount_height !== undefined 
+                        ? that.state.layoutChanges.mount_height 
+                        : newLayout.mount_height;
+                    const hVal = parseFloat(targetHeight);
+                    if (!isNaN(hVal)) {
+                        let safeName = that.state.radar.toLowerCase().replace(/ /g, "_").replace(/-/g, "_");
+                        let hEntId = `number.${safeName}_radar_height`;
+                        if (that._hass && !that._hass.states[hEntId]) {
+                            const found = Object.keys(that._hass.states).find(k => 
+                                k.startsWith(`number.${safeName}`) && 
+                                (k.includes('radar_height') || k.includes('install_height') || k.includes('height'))
+                            );
+                            if (found) hEntId = found;
+                        }
+                        if (that._hass && that._hass.states[hEntId] && that._hass.states[hEntId].state !== 'unavailable' && that._hass.states[hEntId].state !== 'unknown') {
+                            if (Math.abs(parseFloat(that._hass.states[hEntId].state) - hVal) > 0.01) {
+                                that._hass.callService('number', 'set_value', {
+                                    entity_id: hEntId,
+                                    value: String(hVal)
+                                });
+                            }
+                        }
                     }
                 }
                 await that._hass.callService('radar_map_manager', 'update_radar_layout', {

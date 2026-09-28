@@ -71,8 +71,14 @@ export class RadarEditor {
         this.lastClickTime = 0;
         this.isAddingNew = false; 
         this.t = (key, arg0 = "") => {
-            const lang = (this.host.state.hass && this.host.state.hass.language) || 'en';
-            const isZh = lang.startsWith('zh');
+            const stored = localStorage.getItem('rmm_panel_lang');
+            let isZh;
+            if (stored === 'zh' || stored === 'en') {
+                isZh = (stored === 'zh');
+            } else {
+                const lang = (this.host.state.hass && this.host.state.hass.language) || 'en';
+                isZh = lang.startsWith('zh');
+            }
             if (EDITOR_I18N[key]) {
                 let txt = isZh ? EDITOR_I18N[key].zh : EDITOR_I18N[key].en;
                 return txt.replace("{0}", arg0);
@@ -222,7 +228,7 @@ export class RadarEditor {
             if (!state.fov_edit_mode && state.editMode === 'layout' && (state.radar_zone_type === 'hw_detect_zones' || state.radar_zone_type === 'hw_block_zones' || state.radar_zone_type === 'hw_stay_zones')) {
                 const radarData = state.data[state.radar] || {};
                 if (!radarData.capabilities) { alert(this.t("not_supported")); return; }
-                if (radarData.auth_passed === false) { alert(this.t("auth_fail_alert")); return; }
+                if (radarData.capabilities && radarData.auth_passed !== true) { alert(this.t("auth_fail_alert")); return; }
                 if (state.radar_zone_type === 'hw_stay_zones' && radarData.capabilities.model !== 'LD6004') {
                     alert(this.t("hw_stay_unsupported", radarData.capabilities.model || 'Unknown'));
                     return; 
@@ -253,7 +259,7 @@ export class RadarEditor {
                 return;
             }
             const radarData = state.data[state.radar] || {};
-            if (radarData.auth_passed === false) {
+            if (radarData.capabilities && radarData.auth_passed !== true) {
                 alert(this.t("auth_fail_alert"));
                 return;
             }
@@ -290,13 +296,17 @@ export class RadarEditor {
         if (elH) {
             elH.onchange = (e) => {
                 const val = parseFloat(e.target.value);
+                if (isNaN(val)) return;
                 let safeName = state.radar?.toLowerCase().replace(/ /g, "_").replace(/-/g, "_");
                 let hEntId = `number.${safeName}_radar_height`;
                 if (state.hass && !state.hass.states[hEntId]) {
-                    const found = Object.keys(state.hass.states).find(k => k.startsWith(`number.${safeName}`) && k.includes('radar_height'));
+                    const found = Object.keys(state.hass.states).find(k => 
+                        k.startsWith(`number.${safeName}`) && 
+                        (k.includes('radar_height') || k.includes('install_height') || k.includes('height'))
+                    );
                     if (found) hEntId = found;
                 }
-                if (state.hass && state.hass.states[hEntId] && state.hass.states[hEntId].state !== 'unavailable') {
+                if (state.hass && state.hass.states[hEntId] && state.hass.states[hEntId].state !== 'unavailable' && state.hass.states[hEntId].state !== 'unknown') {
                     state.hass.callService('number', 'set_value', { entity_id: hEntId, value: String(val) });
                 }
                 if (callbacks.onLayoutParamChange) callbacks.onLayoutParamChange('mount_height', val);
@@ -704,7 +714,8 @@ export class RadarEditor {
             if (!state.radar || state.radar === 'rd_default') return alert(this.t("sel_radar"));
             const rName = state.radar;
             let ip = (state.data[rName]?.radar_ip || state.data[rName]?.ip || '').trim();
-            const isZh = (state.hass && state.hass.language && state.hass.language.startsWith('zh'));
+            const stored = localStorage.getItem('rmm_panel_lang');
+            const isZh = (stored === 'zh' || (!stored && state.hass?.language?.startsWith('zh')));
             if (!ip && this.host?.fullRawData?.discovered_radars?.[rName]?.ip) {
                 ip = this.host.fullRawData.discovered_radars[rName].ip.trim();
             }
@@ -745,7 +756,8 @@ export class RadarEditor {
         bindClick('btn-radar-ota', () => {
             if (!state.radar || state.radar === 'rd_default') return alert(this.t("sel_radar"));
             const rName = state.radar;
-            const isZh = (state.hass && state.hass.language && state.hass.language.startsWith('zh'));
+            const stored = localStorage.getItem('rmm_panel_lang');
+            const isZh = (stored === 'zh' || (!stored && state.hass?.language?.startsWith('zh')));
             let safeName = rName.toLowerCase().replace(/ /g, "_").replace(/-/g, "_");
             let updateEntId = `update.${safeName}_firmware`;
             if (state.hass && !state.hass.states[updateEntId]) {
@@ -989,7 +1001,7 @@ export class RadarEditor {
                 else {
                     if (state.editMode === 'layout' && (state.radar_zone_type === 'hw_detect_zones' || state.radar_zone_type === 'hw_block_zones' || state.radar_zone_type === 'hw_stay_zones')) {
                         const radarData = state.data[state.radar] || {};
-                        if (radarData.auth_passed === false) { alert(this.t("auth_fail_alert")); return; }
+                        if (radarData.capabilities && radarData.auth_passed !== true) { alert(this.t("auth_fail_alert")); return; }
                         const caps = radarData.capabilities || {};
                         const maxHwZones = caps.max_hw_zones !== undefined ? caps.max_hw_zones : 3; 
                         if (list.length >= maxHwZones) {

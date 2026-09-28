@@ -33,7 +33,10 @@ class FusionEngine:
                 origin_y = float(layout.get('origin_y', 50))
                 caps = r_conf.get("capabilities", {})
                 radar_type = int(layout.get("radar_type", caps.get("radar_type", 1)))
-                radar_h_entity = self.hass.states.get(f"number.{r_name.lower()}_radar_height")
+                safe_r = r_name.lower().replace(" ", "_").replace("-", "_")
+                radar_h_entity = self.hass.states.get(f"number.{safe_r}_radar_height")
+                if not radar_h_entity:
+                    radar_h_entity = self.hass.states.get(f"number.{safe_r}_install_height")
                 if radar_h_entity and radar_h_entity.state not in ['unavailable', 'unknown']:
                     try: radar_h = float(radar_h_entity.state)
                     except ValueError: radar_h = float(layout.get('mount_height', 2.5))
@@ -294,7 +297,8 @@ class FusionEngine:
             return results
         results = []
         base_alpha = max(0.1, min(1.0, (11 - ema_level) / 10.0))
-        max_jump_m = max_jump_base + (max_jump_speed * update_interval) 
+        effective_jump_base = max(1.5, max_jump_base)
+        max_jump_m = effective_jump_base + (max_jump_speed * max(0.1, update_interval)) 
         resurrect_radius_m = 1.5
         used_ids = set()
         for t_id in old_targets.keys():
